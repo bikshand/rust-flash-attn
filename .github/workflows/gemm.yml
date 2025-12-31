@@ -1,0 +1,41 @@
+name: CI - gemm-example
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  gemm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Ensure OpenBLAS is installed if missing
+        run: |
+          # If a libopenblas entry is present in ldconfig, we consider it installed.
+          if ldconfig -p 2>/dev/null | grep -q libopenblas; then
+            echo "OpenBLAS found, skipping install"
+          else
+            echo "OpenBLAS not found; installing libopenblas-dev"
+            sudo apt-get update
+            sudo apt-get install -y libopenblas-dev
+          fi
+
+      - name: Build gemm-example
+        run: |
+          cargo build -p gemm-example --release
+
+      - name: Run gemm-example
+        env:
+          LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu:${{ env.LD_LIBRARY_PATH }}
+        run: |
+          LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH cargo run -p gemm-example --release

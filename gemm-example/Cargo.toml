@@ -1,0 +1,11 @@
+[package]
+name = "gemm-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "0.8"
+libloading = "0.8"
+approx = "0.5"
+rayon = "1.9"
+wide = "0.8"
