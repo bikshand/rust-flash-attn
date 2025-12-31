@@ -1,2 +1,3 @@
 # rust-flash-attn
-FlashAttention in Rust & accompanying tiled library for Rust.
+1. Tiled Matmul plus accompanying tiled library for Rust.
+2. Implement Flash Attention using Tiled mamtul.
