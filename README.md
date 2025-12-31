@@ -8,3 +8,7 @@ This repository contains a small example that demonstrates validating a Rust GEM
 - `gemm-example/` - a small binary that computes SGEMM in Rust and compares against a runtime-loaded BLAS (prefers `libmkl_rt.so`).
 
 See `gemm-example/README.md` for instructions on building and running the example.
+
+## Flash Attention in Rust
+
+TODO
