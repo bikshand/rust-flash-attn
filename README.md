@@ -1,2 +1,2 @@
 # rust-flash-attn
-FlashAttention in Rust
+FlashAttention in Rust & accompanying tiled library for Rust.
