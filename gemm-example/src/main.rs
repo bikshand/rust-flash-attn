@@ -3,10 +3,7 @@ use rand::Rng;
 use std::error::Error;
 
 const CBLAS_ROW_MAJOR: i32 = 101;
-const CBLAS_COL_MAJOR: i32 = 102;
 const CBLAS_NO_TRANS: i32 = 111;
-const CBLAS_TRANS: i32 = 112;
-const CBLAS_CONJ_TRANS: i32 = 113;
 
 fn naive_sgemm(m: usize, n: usize, k: usize, alpha: f32, a: &[f32], b: &[f32], beta: f32, c: &mut [f32]) {
     // A: m x k, B: k x n, C: m x n
@@ -74,7 +71,7 @@ fn tiled_sgemm_parallel_simd(m: usize, n: usize, k: usize, alpha: f32, a: &[f32]
 
     let c_ptr_addr = c.as_mut_ptr() as usize;
 
-    let mut do_work = || {
+    let do_work = || {
         use rayon::prelude::*;
         let row_tiles: Vec<usize> = (0..m).step_by(tile).collect();
         row_tiles.into_par_iter().for_each(|ii| {
@@ -176,6 +173,305 @@ fn call_cblas_sgemm(lib: &Library, m: i32, n: i32, k: i32, alpha: f32, a: &[f32]
     Ok(())
 }
 
+/// Call cblas_sgemm allowing explicit leading dimensions and pointers to tiles.
+fn call_cblas_sgemm_strided(lib: &Library, m: i32, n: i32, k: i32, alpha: f32, a_ptr: *const f32, lda: i32, b_ptr: *const f32, ldb: i32, beta: f32, c_ptr: *mut f32, ldc: i32) -> Result<(), Box<dyn Error>> {
+    unsafe {
+        let func: libloading::Symbol<unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, f32, *const f32, i32, *const f32, i32, f32, *mut f32, i32)> = lib.get(b"cblas_sgemm\0")?;
+        func(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_NO_TRANS,
+            m,
+            n,
+            k,
+            alpha,
+            a_ptr,
+            lda,
+            b_ptr,
+            ldb,
+            beta,
+            c_ptr,
+            ldc,
+        );
+    }
+    Ok(())
+}
+
+/// Tiled SGEMM where each tile multiply is delegated to BLAS. The outer loops are in Rust.
+fn tiled_sgemm_blas_tiles(lib: &Library, m: usize, n: usize, k: usize, alpha: f32, a: &[f32], b: &[f32], beta: f32, c: &mut [f32], tile: usize, threads: Option<usize>) -> Result<(), Box<dyn Error>> {
+    // Scale C by beta first (if needed)
+    if beta != 1.0 {
+        for v in c.iter_mut() {
+            *v *= beta;
+        }
+    }
+
+    let tile = std::cmp::max(1, tile);
+
+    // Resolve the cblas function pointer once so we can call it safely from threads
+    type CblasFn = unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, f32, *const f32, i32, *const f32, i32, f32, *mut f32, i32);
+    let func: libloading::Symbol<CblasFn> = unsafe { lib.get(b"cblas_sgemm\0")? };
+    let fptr: CblasFn = *func;
+
+    let row_tiles: Vec<usize> = (0..m).step_by(tile).collect();
+
+    if let Some(t) = threads {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().expect("Failed to build thread pool");
+        pool.scope(|s| {
+            // Partition C into non-overlapping sub-slices and spawn tasks for each
+        let mut c_rem = &mut c[..];
+        for &ii in &row_tiles {
+            // compute row tile bounds
+            let i_end = (ii + tile).min(m);
+            let rows = i_end - ii;
+            let (c_sub, rest) = c_rem.split_at_mut(rows * n);
+            c_rem = rest;
+            let ii_local = ii;
+            // spawn a task that owns the sub-slice by mutable borrow (scope allows non-'static borrows)
+            s.spawn(move |_| {
+                for kk in (0..k).step_by(tile) {
+                    let k_end = (kk + tile).min(k);
+                    let k_tile = (k_end - kk) as i32;
+                    for jj in (0..n).step_by(tile) {
+                        let j_end = (jj + tile).min(n);
+                        let n_tile = (j_end - jj) as i32;
+                        unsafe {
+                            let a_ptr = a.as_ptr().add(ii_local * k + kk);
+                            let b_ptr = b.as_ptr().add(kk * n + jj);
+                            // c_sub has rows for ii..i_end with full row stride 'n'
+                            let c_ptr = c_sub.as_mut_ptr().add(jj);
+                            fptr(
+                                CBLAS_ROW_MAJOR,
+                                CBLAS_NO_TRANS,
+                                CBLAS_NO_TRANS,
+                                rows as i32,
+                                n_tile,
+                                k_tile,
+                                alpha,
+                                a_ptr,
+                                k as i32,
+                                b_ptr,
+                                n as i32,
+                                1.0f32,
+                                c_ptr,
+                                n as i32,
+                            );
+                        }
+                    }
+                }
+            });
+        }
+        });
+    } else {
+        // Use global Rayon thread pool (if configured via RAYON_NUM_THREADS) for parallelism across row tiles
+        rayon::scope(|s| {
+            // Partition C into non-overlapping sub-slices and spawn scoped tasks that will execute on the global pool
+            let mut c_rem = &mut c[..];
+            for &ii in &row_tiles {
+                let i_end = (ii + tile).min(m);
+                let rows = i_end - ii;
+                let (c_sub, rest) = c_rem.split_at_mut(rows * n);
+                c_rem = rest;
+                let ii_local = ii;
+                s.spawn(move |_| {
+                    for kk in (0..k).step_by(tile) {
+                        let k_end = (kk + tile).min(k);
+                        let k_tile = (k_end - kk) as i32;
+                        for jj in (0..n).step_by(tile) {
+                            let j_end = (jj + tile).min(n);
+                            let n_tile = (j_end - jj) as i32;
+                            unsafe {
+                                let a_ptr = a.as_ptr().add(ii_local * k + kk);
+                                let b_ptr = b.as_ptr().add(kk * n + jj);
+                                // c_sub has rows for ii_local..i_end with full row stride 'n'
+                                let c_ptr = c_sub.as_mut_ptr().add(jj);
+                                fptr(
+                                    CBLAS_ROW_MAJOR,
+                                    CBLAS_NO_TRANS,
+                                    CBLAS_NO_TRANS,
+                                    rows as i32,
+                                    n_tile,
+                                    k_tile,
+                                    alpha,
+                                    a_ptr,
+                                    k as i32,
+                                    b_ptr,
+                                    n as i32,
+                                    1.0f32,
+                                    c_ptr,
+                                    n as i32,
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    Ok(())
+}
+
+/// Tiled SGEMM where each tile is copied into contiguous buffers (packed), passed to BLAS,
+/// and the resulting tile is copied back to the destination matrix.
+fn tiled_sgemm_blas_tiles_copy(lib: &Library, m: usize, n: usize, k: usize, alpha: f32, a: &[f32], b: &[f32], beta: f32, c: &mut [f32], tile: usize, threads: Option<usize>) -> Result<(), Box<dyn Error>> {
+    // Scale C by beta first (if needed)
+    if beta != 1.0 {
+        for v in c.iter_mut() {
+            *v *= beta;
+        }
+    }
+
+    let tile = std::cmp::max(1, tile);
+
+    // Resolve BLAS function once for threaded calls
+    type CblasFn = unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, f32, *const f32, i32, *const f32, i32, f32, *mut f32, i32);
+    let func: libloading::Symbol<CblasFn> = unsafe { lib.get(b"cblas_sgemm\0")? };
+    let fptr: CblasFn = *func;
+
+    let row_tiles: Vec<usize> = (0..m).step_by(tile).collect();
+
+    if let Some(t) = threads {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().expect("Failed to build thread pool");
+        pool.scope(|s| {
+            let mut c_rem = &mut c[..];
+            for &ii in &row_tiles {
+                let i_end = (ii + tile).min(m);
+                let rows = i_end - ii;
+                let (c_sub, rest) = c_rem.split_at_mut(rows * n);
+                c_rem = rest;
+                let ii_local = ii;
+                s.spawn(move |_| {
+                    for kk in (0..k).step_by(tile) {
+                        let k_end = (kk + tile).min(k);
+                        let k_tile = k_end - kk;
+                        for jj in (0..n).step_by(tile) {
+                            let j_end = (jj + tile).min(n);
+                            let n_tile = j_end - jj;
+
+                            // Allocate packed buffers per-task/tile
+                            let mut a_pack = vec![0f32; rows * k_tile];
+                            let mut b_pack = vec![0f32; k_tile * n_tile];
+                            let mut c_pack = vec![0f32; rows * n_tile];
+
+                            // Pack A
+                            for i in 0..rows {
+                                for p in 0..k_tile {
+                                    a_pack[i * k_tile + p] = a[(ii_local + i) * k + (kk + p)];
+                                }
+                            }
+                            // Pack B
+                            for p in 0..k_tile {
+                                for j in 0..n_tile {
+                                    b_pack[p * n_tile + j] = b[(kk + p) * n + (jj + j)];
+                                }
+                            }
+                            // Init C pack from current C slice
+                            for i in 0..rows {
+                                for j in 0..n_tile {
+                                    c_pack[i * n_tile + j] = c_sub[i * n + (jj + j)];
+                                }
+                            }
+
+                            // Call BLAS on packed small tiles
+                            unsafe {
+                                fptr(
+                                    CBLAS_ROW_MAJOR,
+                                    CBLAS_NO_TRANS,
+                                    CBLAS_NO_TRANS,
+                                    rows as i32,
+                                    n_tile as i32,
+                                    k_tile as i32,
+                                    alpha,
+                                    a_pack.as_ptr(),
+                                    k_tile as i32,
+                                    b_pack.as_ptr(),
+                                    n_tile as i32,
+                                    1.0f32,
+                                    c_pack.as_mut_ptr(),
+                                    n_tile as i32,
+                                );
+                            }
+
+                            // Copy back
+                            for i in 0..rows {
+                                for j in 0..n_tile {
+                                    c_sub[i * n + (jj + j)] = c_pack[i * n_tile + j];
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    } else {
+        // Single-threaded fallback (same as previous behavior)
+        for ii in (0..m).step_by(tile) {
+            let i_end = (ii + tile).min(m);
+            let m_tile = i_end - ii;
+            for kk in (0..k).step_by(tile) {
+                let k_end = (kk + tile).min(k);
+                let k_tile = k_end - kk;
+                for jj in (0..n).step_by(tile) {
+                    let j_end = (jj + tile).min(n);
+                    let n_tile = j_end - jj;
+
+                    // Allocate packed buffers
+                    let mut a_pack = vec![0f32; m_tile * k_tile];
+                    let mut b_pack = vec![0f32; k_tile * n_tile];
+                    let mut c_pack = vec![0f32; m_tile * n_tile];
+
+                    // Pack A tile (row-major: m_tile rows, k_tile cols)
+                    for i in 0..m_tile {
+                        for p in 0..k_tile {
+                            a_pack[i * k_tile + p] = a[(ii + i) * k + (kk + p)];
+                        }
+                    }
+
+                    // Pack B tile (row-major representation: k_tile rows, n_tile cols)
+                    for p in 0..k_tile {
+                        for j in 0..n_tile {
+                            b_pack[p * n_tile + j] = b[(kk + p) * n + (jj + j)];
+                        }
+                    }
+
+                    // Initialize C pack from existing C (already scaled by beta)
+                    for i in 0..m_tile {
+                        for j in 0..n_tile {
+                            c_pack[i * n_tile + j] = c[(ii + i) * n + (jj + j)];
+                        }
+                    }
+
+                    // Call BLAS on the small packed tiles. Leading dims are k_tile, n_tile, n_tile respectively.
+                    call_cblas_sgemm_strided(
+                        lib,
+                        m_tile as i32,
+                        n_tile as i32,
+                        k_tile as i32,
+                        alpha,
+                        a_pack.as_ptr(),
+                        k_tile as i32,
+                        b_pack.as_ptr(),
+                        n_tile as i32,
+                        1.0f32,
+                        c_pack.as_mut_ptr(),
+                        n_tile as i32,
+                    )?;
+
+                    // Copy result back to C
+                    for i in 0..m_tile {
+                        for j in 0..n_tile {
+                            c[(ii + i) * n + (jj + j)] = c_pack[i * n_tile + j];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn max_abs_diff(x: &[f32], y: &[f32]) -> f32 {
     x.iter().zip(y.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
 }
@@ -235,16 +531,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
-    // If threads is set, configure BLAS thread envvars and Rayon global pool
+    // If threads is set, configure Rayon global pool. Only force BLAS internals to 1 when GEMM_THREADS > 1
     if let Some(t) = threads {
-        std::env::set_var("OPENBLAS_NUM_THREADS", t.to_string());
-        std::env::set_var("OMP_NUM_THREADS", t.to_string());
-        std::env::set_var("MKL_NUM_THREADS", t.to_string());
-        std::env::set_var("RAYON_NUM_THREADS", t.to_string());
-        // try to set global rayon pool; ignore error if already set
-        let _ = rayon::ThreadPoolBuilder::new().num_threads(t).build_global();
-        println!("Set thread count to {} (OPENBLAS_NUM_THREADS, MKL_NUM_THREADS, OMP_NUM_THREADS, RAYON_NUM_THREADS)", t);
+        if t > 1 {
+            // For multi-threaded tile-level execution, avoid oversubscription by forcing BLAS internals to 1
+            std::env::set_var("OPENBLAS_NUM_THREADS", "1");
+            std::env::set_var("OMP_NUM_THREADS", "1");
+            std::env::set_var("MKL_NUM_THREADS", "1");
+            // Set Rayon threads explicitly for multi-threaded case
+            std::env::set_var("RAYON_NUM_THREADS", t.to_string());
+            // try to set global rayon pool; ignore error if already set
+            let _ = rayon::ThreadPoolBuilder::new().num_threads(t).build_global();
+            println!("Set GEMM thread count to {} (Rayon) and forced BLAS internals to 1 to avoid oversubscription", t);
+        } else {
+            // For GEMM_THREADS == 1, leave BLAS and Rayon env vars untouched so they can be varied externally
+            println!("Set GEMM thread count to 1 (no changes to BLAS/Rayon env vars)",);
+        }
     }
+
+    // Print effective thread configuration
+    let gemm_threads_val = threads.map(|t| t.to_string()).unwrap_or_else(|| "unset".to_string());
+    let openblas_val = std::env::var("OPENBLAS_NUM_THREADS").unwrap_or_else(|_| "unset".to_string());
+    let rayon_val = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "unset".to_string());
+    println!("GEMM_THREADS = {}, OPENBLAS_NUM_THREADS = {}, RAYON_NUM_THREADS = {}", gemm_threads_val, openblas_val, rayon_val);
 
     let tol = 1e-3f32;
 
@@ -300,26 +609,44 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             None
         };
-        tiled_sgemm_parallel_simd(m, n, k, alpha, &a, &b, beta, &mut c_par_simd, tile, threads);
+        // If GEMM_THREADS == 1, treat it as "no explicit per-function thread count" so global RAYON_NUM_THREADS can be varied.
+        let threads_for_calls = match threads {
+            Some(1) => None,
+            other => other,
+        };
+        tiled_sgemm_parallel_simd(m, n, k, alpha, &a, &b, beta, &mut c_par_simd, tile, threads_for_calls);
 
         // BLAS
         let mut c_blas = c_init.clone();
         call_cblas_sgemm(&lib, m as i32, n as i32, k as i32, alpha, &a, &b, beta, &mut c_blas)?;
 
+        // Tiled BLAS: outer loops in Rust, inner tiles delegated to BLAS
+        let mut c_tiled_blas = c_init.clone();
+        tiled_sgemm_blas_tiles(&lib, m, n, k, alpha, &a, &b, beta, &mut c_tiled_blas, tile, threads_for_calls)?;
+
+        // Tiled BLAS (pack/copy): copy each tile to contiguous buffers, call BLAS, copy back
+        let mut c_tiled_blas_copy = c_init.clone();
+        tiled_sgemm_blas_tiles_copy(&lib, m, n, k, alpha, &a, &b, beta, &mut c_tiled_blas_copy, tile, threads_for_calls)?;
+
         let diff_naive_blas = max_abs_diff(&c_naive, &c_blas);
         let diff_tiled_blas = max_abs_diff(&c_tiled, &c_blas);
         let diff_par_blas = max_abs_diff(&c_par_simd, &c_blas);
+        let diff_tiledblas_blas = max_abs_diff(&c_tiled_blas, &c_blas);
+        let diff_tiledblascopy_blas = max_abs_diff(&c_tiled_blas_copy, &c_blas);
         let diff_naive_tiled = max_abs_diff(&c_naive, &c_tiled);
         let diff_naive_par = max_abs_diff(&c_naive, &c_par_simd);
 
         println!("Naive vs BLAS max abs diff: {} (tol = {})", diff_naive_blas, tol);
         println!("Tiled vs BLAS max abs diff: {} (tol = {})", diff_tiled_blas, tol);
+        println!("Tiled-BLAS-Copy vs BLAS max abs diff: {} (tol = {})", diff_tiledblascopy_blas, tol);
         println!("Parallel+SIMD vs BLAS max abs diff: {} (tol = {})", diff_par_blas, tol);
         println!("Naive vs Tiled max abs diff: {}", diff_naive_tiled);
         println!("Naive vs Parallel+SIMD max abs diff: {}", diff_naive_par);
 
         let ok_naive = diff_naive_blas <= tol;
         let ok_tiled = diff_tiled_blas <= tol;
+        let ok_tiled_blas = diff_tiledblas_blas <= tol;
+        let ok_tiled_blas_copy = diff_tiledblascopy_blas <= tol;
         let ok_par = diff_par_blas <= tol;
 
         if ok_naive {
@@ -333,6 +660,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("✅ size {}x{}x{} (tiled tile={}): OK", m, n, k, tile);
         } else {
             println!("❌ size {}x{}x{} (tiled tile={}): FAILED (maxdiff > {})", m, n, k, tile, tol);
+            any_fail = true;
+        }
+
+        if ok_tiled_blas {
+            println!("✅ size {}x{}x{} (tiled-BLAS tile={}): OK", m, n, k, tile);
+        } else {
+            println!("❌ size {}x{}x{} (tiled-BLAS tile={}): FAILED (maxdiff > {})", m, n, k, tile, tol);
+            any_fail = true;
+        }
+
+        if ok_tiled_blas_copy {
+            println!("✅ size {}x{}x{} (tiled-BLAS-Copy tile={}): OK", m, n, k, tile);
+        } else {
+            println!("❌ size {}x{}x{} (tiled-BLAS-Copy tile={}): FAILED (maxdiff > {})", m, n, k, tile, tol);
             any_fail = true;
         }
 
@@ -391,11 +732,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         for _ in 0..repeats {
             let mut c_tmp = c_init.clone();
             let start = Instant::now();
-            tiled_sgemm_parallel_simd(m, n, k, alpha, &a, &b, beta, &mut c_tmp, tile, threads);
+            tiled_sgemm_parallel_simd(m, n, k, alpha, &a, &b, beta, &mut c_tmp, tile, threads_for_calls);
             t_par += start.elapsed().as_secs_f64();
         }
         let avg_par = t_par / (repeats as f64);
         let gflops_par = flops / (avg_par * 1e9);
+
+        // Time tiled BLAS
+        let mut t_tiled_blas = 0f64;
+        for _ in 0..repeats {
+            let mut c_tmp = c_init.clone();
+            let start = Instant::now();
+            tiled_sgemm_blas_tiles(&lib, m, n, k, alpha, &a, &b, beta, &mut c_tmp, tile, threads_for_calls)?;
+            t_tiled_blas += start.elapsed().as_secs_f64();
+        }
+        let avg_tiled_blas = t_tiled_blas / (repeats as f64);
+        let gflops_tiled_blas = flops / (avg_tiled_blas * 1e9);
+
+        // Time tiled BLAS (pack/copy)
+        let mut t_tiled_blas_copy = 0f64;
+        for _ in 0..repeats {
+            let mut c_tmp = c_init.clone();
+            let start = Instant::now();
+            tiled_sgemm_blas_tiles_copy(&lib, m, n, k, alpha, &a, &b, beta, &mut c_tmp, tile, threads_for_calls)?;
+            t_tiled_blas_copy += start.elapsed().as_secs_f64();
+        }
+        let avg_tiled_blas_copy = t_tiled_blas_copy / (repeats as f64);
+        let gflops_tiled_blas_copy = flops / (avg_tiled_blas_copy * 1e9);
 
         // Time BLAS
         let mut t_blas = 0f64;
@@ -412,6 +775,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("  Naive  : {:>9.6} s  {:>8.3} GFLOPS", avg_naive, gflops_naive);
         println!("  Tiled  : {:>9.6} s  {:>8.3} GFLOPS", avg_tiled, gflops_tiled);
         println!("  Par+SIMD: {:>8.6} s  {:>8.3} GFLOPS", avg_par, gflops_par);
+        println!("  Tiled-BLAS: {:>9.6} s  {:>8.3} GFLOPS", avg_tiled_blas, gflops_tiled_blas);
+        println!("  Tiled-BLAS-Copy: {:>9.6} s  {:>8.3} GFLOPS", avg_tiled_blas_copy, gflops_tiled_blas_copy);
         println!("  BLAS   : {:>9.6} s  {:>8.3} GFLOPS", avg_blas, gflops_blas);
 
         println!("");
